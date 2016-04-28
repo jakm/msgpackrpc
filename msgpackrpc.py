@@ -3,6 +3,7 @@
 import msgpack
 import socket
 import threading
+import time
 from collections import deque
 from contextlib import contextmanager
 
@@ -135,7 +136,7 @@ class Connection(object):
         except socket.error as e:
             err = ConnectionError(str(e))
 
-        if err != None:
+        if err is not None:
             self.close()
             raise err
 
@@ -153,14 +154,18 @@ class Connection(object):
         except socket.error as e:
             err = ConnectionError(str(e))
 
-        if err != None:
+        if err is not None:
             self.close()
             raise err
 
 
 class ConnectionPool(object):
+
+    retries = 3
+    delay = 1
+
     def __init__(self, host, port, connect_timeout=None, socket_timeout=None,
-                 encoding='utf-8', size=10):
+                 encoding='utf-8', size=10, lazy=True):
         self.host = host
         self.port = port
         self.connect_timeout = connect_timeout
@@ -168,51 +173,69 @@ class ConnectionPool(object):
         self.encoding = encoding
         self.size = size
 
-        self._lock = threading.RLock()
-        self._cond = threading.Condition(self._lock)
+        self._lock = threading.Lock()
         self._connections = deque()
 
+        if lazy:
+            self._connected = True
+        else:
+            self._connected = False
+            self._connect()
+
     def _new_connection(self):
-        return Connection(self.host, self.port, self.connect_timeout,
+        conn = Connection(self.host, self.port, self.connect_timeout,
                           self.socket_timeout, self.encoding)
 
-    def connect(self):
-        with self._lock:
-            err = None
+        for _ in range(self.retries):
+            try:
+                return conn.connect()
+            except ConnectionError as e:
+                pass
 
-            for _ in range(8): # FIXME: attempts!!!!
-                try:
-                    for _ in range(self.size - len(self._connections)):
-                        conn = self._new_connection()
-                        self.put(conn.connect())
-                except ConnectionError as e:
-                    err = e
+            time.sleep(self.delay)
 
-                if len(self._connections) == self.size:
-                    break
-            else:
-                print err
-                self.close() # FIXME: tady se to zamyka podruhe
-                assert err is not None
-                raise err
+        raise e
+
+    def _connect(self):
+        try:
+            while self.waiting < self.size:
+                conn = self._new_connection()
+                self._connections.appendleft(conn)
+        except ConnectionError:
+            self.close()
+            raise
+
+        self._connected = True
 
     def close(self):
         with self._lock:
-            while len(self._connections):
+            while self.waiting > 0:
                 conn = self._connections.pop()
                 conn.close()
+            self._connected = False
+
+    @property
+    def waiting(self):
+        return len(self._connections)
 
     def get(self):
+        if not self._connected:
+            raise ConnectionError('Not connected')
+
         with self._lock:
-            if len(self._connections) > 0:
+            if self.waiting > 0:
                 return self._connections.pop()
 
             conn = self._new_connection()
-            return conn.connect() # FIXME: attempts !!!
+            return conn
 
     def put(self, conn):
-        with self._lock: # FIXME: tady se to zamyka podruhe
-            if len(self._connections) < self.size:
+        if not self._connected:
+            conn.close()
+            return
+
+        with self._lock:
+            if self.waiting < self.size:
                 if conn.is_connected():
                     self._connections.appendleft(conn)
             else:
