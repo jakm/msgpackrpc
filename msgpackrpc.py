@@ -50,8 +50,8 @@ class Connection(object):
         self.connect_timeout = connect_timeout
         self.socket_timeout = socket_timeout
 
-        self.packer = msgpack.Packer(encoding=encoding)
-        self.unpacker = msgpack.Unpacker(encoding=encoding,
+        self._packer = msgpack.Packer(encoding=encoding)
+        self._unpacker = msgpack.Unpacker(encoding=encoding,
                                          unicode_errors='strict')
 
         self._socket = None
@@ -120,7 +120,7 @@ class Connection(object):
 
     def _write_message(self, message):
         try:
-            data = self.packer.pack(message)
+            data = self._packer.pack(message)
         except Exception as e:
             raise SerializationError('Serialization failed: %s' % e)
 
@@ -146,8 +146,8 @@ class Connection(object):
         try:
             while True:
                 data = self._socket.recv(BUFSIZE)
-                self.unpacker.feed(data)
-                for message in self.unpacker:
+                self._unpacker.feed(data)
+                for message in self._unpacker:
                     return message
         except socket.timeout as e:
             err = ConnectionTimeout(str(e))
@@ -165,42 +165,51 @@ class ConnectionPool(object):
     delay = 1
 
     def __init__(self, host, port, connect_timeout=None, socket_timeout=None,
-                 encoding='utf-8', size=10, lazy=True):
+                 encoding='utf-8', size=10, lazy=True, expanding=False):
         self.host = host
         self.port = port
         self.connect_timeout = connect_timeout
         self.socket_timeout = socket_timeout
         self.encoding = encoding
-        self.size = size
+        self.max_size = size
+        self.expanding = expanding
 
         self._lock = threading.Lock()
-        self._connections = deque()
+        self._pool = []
+        self._conn_queue = deque()
+        self._conn_ready = threading.Condition(self._lock)
 
         if lazy:
             self._connected = True
         else:
             self._connected = False
-            self._connect()
+            self._connect_pool()
 
-    def _new_connection(self):
+    def _open_connection(self):
         conn = Connection(self.host, self.port, self.connect_timeout,
                           self.socket_timeout, self.encoding)
 
         for _ in range(self.retries):
             try:
-                return conn.connect()
+                conn.connect()
+                break
             except ConnectionError as e:
-                pass
+                time.sleep(self.delay)
+        else:
+            raise e
 
-            time.sleep(self.delay)
+        self._pool.append(conn)
+        return conn
 
-        raise e
+    def _destroy_connnection(self, conn):
+        conn.close()
+        self._pool.remove(conn)
 
-    def _connect(self):
+    def _connect_pool(self):
         try:
-            while self.waiting < self.size:
-                conn = self._new_connection()
-                self._connections.appendleft(conn)
+            while self.size < self.max_size:
+                conn = self._open_connection()
+                self._conn_queue.appendleft(conn)
         except ConnectionError:
             self.close()
             raise
@@ -209,37 +218,59 @@ class ConnectionPool(object):
 
     def close(self):
         with self._lock:
-            while self.waiting > 0:
-                conn = self._connections.pop()
-                conn.close()
+            self._conn_queue.clear()
+            while self.size > 0:
+                self._destroy_connnection(self._pool[0])
             self._connected = False
+            self._conn_ready.notify_all()
 
     @property
-    def waiting(self):
-        return len(self._connections)
+    def size(self):
+        return len(self._pool)
+
+    @property
+    def enqueued(self):
+        return len(self._conn_queue)
 
     def get(self):
-        if not self._connected:
-            raise ConnectionError('Not connected')
-
         with self._lock:
-            if self.waiting > 0:
-                return self._connections.pop()
+            if not self._connected:
+                raise ConnectionError('Not connected')
 
-            conn = self._new_connection()
+            # lazy initialization
+            if self.size < self.max_size:
+                conn = self._open_connection()
+                return conn
+
+            if self.expanding:
+                if self.enqueued == 0:  # empty queue -> open new connection
+                    conn = self._open_connection()
+                else:
+                    conn = self._conn_queue.pop()
+            else:
+                while self.enqueued == 0:  # empty queue -> wait for connection
+                    if not self._connected:
+                        raise ConnectionError('Not connected')
+                    self._conn_ready.wait()
+                conn = self._conn_queue.pop()
+
+            if not conn.is_connected():
+                self._destroy_connnection(conn)
+                conn = self._open_connection()
+
             return conn
 
     def put(self, conn):
-        if not self._connected:
-            conn.close()
-            return
-
         with self._lock:
-            if self.waiting < self.size:
-                if conn.is_connected():
-                    self._connections.appendleft(conn)
+            if not self._connected:
+                self._destroy_connnection(conn)
+                return
+
+            if self.enqueued < self.size:
+                self._conn_queue.appendleft(conn)
+                self._conn_ready.notify()
             else:
-                conn.close()
+                self._destroy_connnection(conn)
 
     @contextmanager
     def get_connection(self):
